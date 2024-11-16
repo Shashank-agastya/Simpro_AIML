@@ -1,0 +1,296 @@
+from flask import Flask, render_template, request, session, redirect, url_for
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key_here'  # Required for sessions
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///career_advisor.db'
+db = SQLAlchemy(app)
+
+
+# Database Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    education = db.Column(db.String(200))
+    skills = db.Column(db.String(500))
+    experience = db.Column(db.Integer)
+    interests = db.Column(db.String(500))
+
+
+# Simple skill matching without ML
+def get_job_matches(user_skills):
+    # Mock job data - in real app, this would come from API/database
+    available_jobs = [
+        {
+            'title': 'Software Developer',
+            'company': 'Tech Corp',
+            'skills': 'python, javascript, sql',
+            'description': 'Looking for a skilled software developer...',
+            'location': 'New York',
+            'match_score': 0
+        },
+        {
+            'title': 'Data Analyst',
+            'company': 'Data Inc',
+            'skills': 'python, sql, excel',
+            'description': 'Seeking data analyst with strong analytical skills...',
+            'location': 'Remote',
+            'match_score': 0
+        },
+        {
+            'title': 'Web Developer',
+            'company': 'Web Solutions',
+            'skills': 'html, css, javascript',
+            'description': 'Frontend developer position...',
+            'location': 'San Francisco',
+            'match_score': 0
+        }
+    ]
+
+    user_skills_list = [skill.strip().lower() for skill in user_skills.split(',')]
+
+    # Calculate match scores
+    for job in available_jobs:
+        job_skills = [skill.strip().lower() for skill in job['skills'].split(',')]
+        matching_skills = set(user_skills_list) & set(job_skills)
+        job['match_score'] = (len(matching_skills) / len(job_skills)) * 100
+        job['matching_skills'] = list(matching_skills)
+        job['missing_skills'] = list(set(job_skills) - set(user_skills_list))
+
+    return sorted(available_jobs, key=lambda x: x['match_score'], reverse=True)
+
+
+@app.route('/')
+def home():
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AI Career Advisor</title>
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-gray-100">
+        <nav class="bg-blue-600 text-white p-4">
+            <div class="container mx-auto flex justify-between items-center">
+                <h1 class="text-2xl font-bold">AI Career Advisor</h1>
+                <div>
+                    <a href="/login" class="px-4 py-2 bg-blue-500 rounded hover:bg-blue-400">Login</a>
+                    <a href="/register" class="px-4 py-2 bg-green-500 rounded hover:bg-green-400">Register</a>
+                </div>
+            </div>
+        </nav>
+
+        <div class="container mx-auto mt-10 p-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div class="bg-white p-6 rounded-lg shadow">
+                    <h2 class="text-2xl font-bold mb-4">Find Your Dream Job</h2>
+                    <p class="text-gray-600">
+                        Our platform analyzes your skills, education, and experience
+                        to match you with the perfect job opportunities.
+                    </p>
+                </div>
+
+                <div class="bg-white p-6 rounded-lg shadow">
+                    <h2 class="text-2xl font-bold mb-4">Skill Development</h2>
+                    <p class="text-gray-600">
+                        Get personalized recommendations for skills you need to develop
+                        to reach your career goals.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        # Check if the username already exists
+        existing_user = User.query.filter_by(username=request.form['username']).first()
+
+        if existing_user:
+            # If the username exists, show an error and redirect to login page
+            return redirect(url_for('login'))
+
+        # Create a new user if the username does not exist
+        user = User(
+            username=request.form['username'],
+            password=request.form['password'],
+            education=request.form['education'],
+            skills=request.form['skills'],
+            experience=int(request.form['experience']),
+            interests=request.form['interests']
+        )
+        db.session.add(user)
+        db.session.commit()
+        return redirect(url_for('login'))  # Redirect to login after registration
+
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Register - AI Career Advisor</title>
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-gray-100">
+        <div class="container mx-auto mt-10 max-w-md">
+            <form method="POST" class="bg-white p-6 rounded-lg shadow">
+                <h2 class="text-2xl font-bold mb-6">Register</h2>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Username</label>
+                    <input type="text" name="username" class="w-full p-2 border rounded" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Password</label>
+                    <input type="password" name="password" class="w-full p-2 border rounded" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Education</label>
+                    <input type="text" name="education" class="w-full p-2 border rounded" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Skills (comma-separated)</label>
+                    <input type="text" name="skills" class="w-full p-2 border rounded" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Years of Experience</label>
+                    <input type="number" name="experience" class="w-full p-2 border rounded" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Interests</label>
+                    <input type="text" name="interests" class="w-full p-2 border rounded" required>
+                </div>
+
+                <button type="submit" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-400">
+                    Register
+                </button>
+            </form>
+        </div>
+    </body>
+    </html>
+    '''
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        user = User.query.filter_by(
+            username=request.form['username'],
+            password=request.form['password']
+        ).first()
+
+        if user:
+            session['username'] = user.username
+            return redirect(url_for('dashboard'))
+
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Login - AI Career Advisor</title>
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-gray-100">
+        <div class="container mx-auto mt-10 max-w-md">
+            <form method="POST" class="bg-white p-6 rounded-lg shadow">
+                <h2 class="text-2xl font-bold mb-6">Login</h2>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Username</label>
+                    <input type="text" name="username" class="w-full p-2 border rounded" required>
+                </div>
+
+                <div class="mb-4">
+                    <label class="block text-gray-700 mb-2">Password</label>
+                    <input type="password" name="password" class="w-full p-2 border rounded" required>
+                </div>
+
+                <button type="submit" class="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-400">
+                    Login
+                </button>
+            </form>
+        </div>
+    </body>
+    </html>
+    '''
+
+
+@app.route('/dashboard')
+def dashboard():
+    if 'username' not in session:
+        return redirect(url_for('login'))
+
+    user = User.query.filter_by(username=session['username']).first()
+    job_matches = get_job_matches(user.skills)
+
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Dashboard - AI Career Advisor</title>
+        <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-gray-100">
+        <nav class="bg-blue-600 text-white p-4">
+            <div class="container mx-auto flex justify-between items-center">
+                <h1 class="text-2xl font-bold">AI Career Advisor</h1>
+                <a href="/logout" class="px-4 py-2 bg-red-500 rounded hover:bg-red-400">Logout</a>
+            </div>
+        </nav>
+
+        <div class="container mx-auto mt-10 p-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div class="bg-white p-6 rounded-lg shadow">
+                    <h2 class="text-2xl font-bold mb-4">Your Profile</h2>
+                    <p><strong>Education:</strong> ''' + user.education + '''</p>
+                    <p><strong>Skills:</strong> ''' + user.skills + '''</p>
+                    <p><strong>Experience:</strong> ''' + str(user.experience) + ''' years</p>
+                </div>
+            </div>
+
+            <div class="mt-8">
+                <h2 class="text-2xl font-bold mb-4">Job Matches</h2>
+                ''' + ''.join([f'''
+                <div class="bg-white p-6 rounded-lg shadow mb-4">
+                    <div class="flex justify-between items-center">
+                        <h3 class="text-xl font-bold">{job['title']}</h3>
+                        <span class="text-lg font-bold text-blue-600">{job['match_score']:.1f}% Match</span>
+                    </div>
+                    <p class="text-gray-600 mt-2">{job['company']} - {job['location']}</p>
+                    <div class="mt-4">
+                        <h4 class="font-bold">Required Skills:</h4>
+                        <p class="text-gray-600">{job['skills']}</p>
+                    </div>
+                    <div class="mt-4">
+                        <h4 class="font-bold">Missing Skills:</h4>
+                        <p class="text-red-500">{', '.join(job['missing_skills'])}</p>
+                    </div>
+                </div>
+                ''' for job in job_matches]) + '''
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+
+
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    return redirect(url_for('home'))
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)

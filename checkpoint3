@@ -1,0 +1,247 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import requests
+from bs4 import BeautifulSoup
+import json
+from datetime import datetime
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import logging
+from typing import List, Dict, Any, Optional
+import re
+from concurrent.futures import ThreadPoolExecutor
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer
+import pickle
+import os
+from flask import Flask, jsonify, request, session
+from flask_login import login_required, UserMixin
+from flask_sqlalchemy import SQLAlchemy
+from urllib.parse import urljoin, urlparse
+from requests.exceptions import RequestException
+
+# Flask App Setup
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key'  # Should be environment variable in production
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Initialize logging with more detailed configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# NLTK data setup
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+    nltk.download('stopwords')
+    nltk.download('wordnet')
+    nltk.download('averaged_perceptron_tagger')
+
+
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    password = db.Column(db.String(150), nullable=False)
+    education = db.Column(db.Text)
+    skills = db.Column(db.Text)
+    experience = db.Column(db.Text)
+    interests = db.Column(db.Text)
+    career_history = db.Column(db.Text)
+    personality_traits = db.Column(db.Text)
+    preferred_work_environment = db.Column(db.Text)
+
+
+class JobRecommender:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+        self.sentiment_analyzer = pipeline('sentiment-analysis')
+        self.skill_extractor = pipeline('ner', model='dslim/bert-base-NER')
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.lemmatizer = WordNetLemmatizer()
+        self.job_cache_file = 'job_cache.pkl'
+        self.job_cache_expiry = 24 * 60 * 60  # 24 hours in seconds
+
+        # Base URLs with validation
+        self.job_sources = {
+            'github': 'https://jobs.github.com/positions.json',
+            'stackoverflow': 'https://stackoverflow.com/jobs/feed',
+            'linkedin': 'https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search'
+        }
+
+        # Validate base URLs during initialization
+        self._validate_base_urls()
+
+    def _validate_base_urls(self):
+        """Validate all base URLs in job_sources."""
+        for source, url in self.job_sources.items():
+            if not self._is_valid_url(url):
+                self.logger.error(f"Invalid base URL for {source}: {url}")
+                del self.job_sources[source]
+
+    def _is_valid_url(self, url: str) -> bool:
+        """Validate URL format and allowed domains."""
+        try:
+            result = urlparse(url)
+            allowed_domains = [
+                'jobs.github.com',
+                'stackoverflow.com',
+                'linkedin.com'
+            ]
+            return all([
+                result.scheme in ('http', 'https'),
+                result.netloc in allowed_domains
+            ])
+        except Exception as e:
+            self.logger.error(f"URL validation error: {str(e)}")
+            return False
+
+    def _build_request_url(self, base_url: str, params: Dict) -> Optional[str]:
+        """Safely build request URL with parameters."""
+        try:
+            if not self._is_valid_url(base_url):
+                return None
+
+            # Clean and validate parameters
+            clean_params = {
+                k: str(v) for k, v in params.items()
+                if isinstance(v, (str, int, float, bool))
+            }
+
+            return requests.Request('GET', base_url, params=clean_params).prepare().url
+        except Exception as e:
+            self.logger.error(f"Error building request URL: {str(e)}")
+            return None
+
+    def fetch_jobs_from_source(self, source: str, params: Dict) -> List[Dict]:
+        """Fetch jobs from a specific source with improved error handling and URL validation."""
+        if source not in self.job_sources:
+            self.logger.error(f"Unknown job source: {source}")
+            return []
+
+        base_url = self.job_sources[source]
+        request_url = self._build_request_url(base_url, params)
+
+        if not request_url:
+            self.logger.error(f"Invalid request URL for source: {source}")
+            return []
+
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
+
+            response = requests.get(
+                request_url,
+                headers=headers,
+                timeout=10,
+                verify=True  # Enforce SSL verification
+            )
+            response.raise_for_status()
+
+            if source == 'github':
+                return response.json()
+            elif source == 'stackoverflow':
+                soup = BeautifulSoup(response.content, 'xml')
+                return self._parse_stackoverflow_feed(soup)
+            elif source == 'linkedin':
+                return response.json().get('jobs', [])
+
+        except RequestException as e:
+            self.logger.error(f"Request error for {source}: {str(e)}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON parsing error for {source}: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error fetching jobs from {source}: {str(e)}")
+
+        return []
+
+    def analyze_job_market(self, user_profile: Dict) -> Dict[str, Any]:
+        """Analyze job market based on user profile with improved error handling."""
+        try:
+            user_skills = user_profile.get('skills', '').split(', ')
+            if not user_skills:
+                return {
+                    'status': 'error',
+                    'message': 'No skills provided in user profile'
+                }
+
+            jobs = self.fetch_all_jobs(user_skills)
+
+            if not jobs:
+                return {
+                    'status': 'warning',
+                    'message': 'No jobs found',
+                    'data': {
+                        'recommended_jobs': [],
+                        'market_trends': {'jobs_found': 0}
+                    }
+                }
+
+            return {
+                'status': 'success',
+                'data': {
+                    'recommended_jobs': jobs[:5],
+                    'market_trends': {'jobs_found': len(jobs)}
+                }
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error in job market analysis: {str(e)}")
+            return {
+                'status': 'error',
+                'message': 'Error analyzing job market'
+            }
+
+
+@app.route('/api/job-recommendations', methods=['POST'])
+@login_required
+def get_job_recommendations():
+    """Get job recommendations with improved error handling and response structure."""
+    try:
+        user = User.query.get(session.get('user_id'))
+        if not user:
+            return jsonify({
+                'status': 'error',
+                'message': 'User not found'
+            }), 404
+
+        user_profile = {
+            'education': user.education,
+            'skills': user.skills,
+            'experience': user.experience,
+            'interests': user.interests
+        }
+
+        recommender = JobRecommender()
+        analysis_results = recommender.analyze_job_market(user_profile)
+
+        return jsonify(analysis_results)
+
+    except Exception as e:
+        logger.error(f"Error generating recommendations: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': 'Internal server error'
+        }), 500
+
+
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+    app.run(debug=False)  # Set to False in production
